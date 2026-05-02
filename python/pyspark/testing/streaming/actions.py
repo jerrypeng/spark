@@ -1,0 +1,271 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+"""Declarative actions for the PySpark ``StreamTest`` framework.
+
+Each action is a small dataclass-like value object that carries the inputs
+needed by the ``StreamTest`` driver loop. The driver matches on action type
+and dispatches accordingly. Mirrors Scala's ``StreamAction`` hierarchy.
+"""
+
+from __future__ import annotations
+
+from abc import ABC
+from typing import Any, Callable, Dict, List, Optional, Type
+
+from pyspark.testing.streaming.memory_stream import MemoryStream
+
+
+class StreamAction(ABC):
+    """Base class for all stream test actions."""
+
+    @property
+    def requires_running_stream(self) -> bool:
+        """Whether this action requires the stream to be actively running."""
+        return False
+
+    def __repr__(self) -> str:
+        return self.__class__.__name__
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle / data
+# ---------------------------------------------------------------------------
+
+
+class StartStream(StreamAction):
+    """Start (or restart) the streaming query under test.
+
+    Parameters
+    ----------
+    trigger : dict, optional
+        Keyword args passed to ``DataStreamWriter.trigger``, e.g.
+        ``{"processingTime": "0 seconds"}`` or ``{"once": True}``.
+    extra_options : dict, optional
+        Extra options passed to ``DataStreamWriter.option``.
+    checkpoint_location : str, optional
+        Override the auto-allocated checkpoint location. Use with care:
+        ``MemoryStream`` cannot recover from a checkpoint, so reusing a
+        checkpoint that has offset history will fail.
+    """
+
+    def __init__(
+        self,
+        trigger: Optional[Dict[str, Any]] = None,
+        extra_options: Optional[Dict[str, str]] = None,
+        checkpoint_location: Optional[str] = None,
+    ) -> None:
+        self.trigger = trigger
+        self.extra_options = extra_options
+        self.checkpoint_location = checkpoint_location
+
+    def __repr__(self) -> str:
+        parts: List[str] = []
+        if self.trigger:
+            parts.append(f"trigger={self.trigger}")
+        if self.extra_options:
+            parts.append(f"extra_options={self.extra_options}")
+        if self.checkpoint_location:
+            parts.append(f"checkpoint_location={self.checkpoint_location}")
+        return f"StartStream({', '.join(parts)})"
+
+
+class StopStream(StreamAction):
+    """Stop the currently running query and assert clean shutdown."""
+
+    @property
+    def requires_running_stream(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return "StopStream()"
+
+
+class AddData(StreamAction):
+    """Append data to a ``MemoryStream`` source.
+
+    Parameters
+    ----------
+    source : MemoryStream
+        The stream to append to.
+    *data
+        Rows to add. Same flexibility as ``MemoryStream.add_data``.
+    """
+
+    def __init__(self, source: MemoryStream, *data: Any) -> None:
+        if not isinstance(source, MemoryStream):
+            raise TypeError(
+                f"AddData source must be a MemoryStream, got {type(source).__name__}"
+            )
+        self.source = source
+        self.data = data
+
+    def __repr__(self) -> str:
+        # Truncate long data lists in error messages.
+        preview = self.data if len(self.data) <= 6 else (*self.data[:6], "...")
+        return f"AddData(source={self.source}, data={preview})"
+
+
+class ProcessAllAvailable(StreamAction):
+    """Block until ``StreamingQuery.processAllAvailable()`` returns."""
+
+    @property
+    def requires_running_stream(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return "ProcessAllAvailable()"
+
+
+# ---------------------------------------------------------------------------
+# Failure handling
+# ---------------------------------------------------------------------------
+
+
+class ExpectFailure(StreamAction):
+    """Wait for the stream to terminate with an exception of the given type.
+
+    Parameters
+    ----------
+    exception_type : type
+        The expected exception class. Matched against the raw class name as it
+        appears in the streaming query's exception message (which is
+        sufficient for simple JVM/Python class identification across PySpark
+        modes).
+    assert_failure : callable, optional
+        Optional ``(StreamingQueryException) -> None`` callback that runs
+        additional assertions on the captured exception.
+    """
+
+    def __init__(
+        self,
+        exception_type: Type[BaseException] = Exception,
+        assert_failure: Optional[Callable[[BaseException], None]] = None,
+    ) -> None:
+        self.exception_type = exception_type
+        self.assert_failure = assert_failure
+
+    @property
+    def requires_running_stream(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return f"ExpectFailure({self.exception_type.__name__})"
+
+
+# ---------------------------------------------------------------------------
+# Assertions / arbitrary callbacks
+# ---------------------------------------------------------------------------
+
+
+class Assert(StreamAction):
+    """Assert that an arbitrary zero-arg callable returns truthy.
+
+    Used for cross-checking external state (counters, captured rows from
+    a ``foreachBatch``-style sink, etc.).
+    """
+
+    def __init__(self, condition: Callable[[], bool], message: str = "") -> None:
+        self.condition = condition
+        self.message = message
+
+    def __repr__(self) -> str:
+        return f"Assert(condition={_callable_label(self.condition)}, message={self.message!r})"
+
+
+class AssertOnQuery(StreamAction):
+    """Assert a predicate against the active ``StreamingQuery``.
+
+    The predicate receives the current query (the most recently
+    started/stopped one if no stream is currently running) and must
+    return truthy on success.
+    """
+
+    def __init__(
+        self,
+        condition: Callable[[Any], bool],
+        message: str = "",
+    ) -> None:
+        self.condition = condition
+        self.message = message
+
+    @property
+    def requires_running_stream(self) -> bool:
+        # The Scala equivalent allows assertions after StopStream -- we follow
+        # the same convention by *not* requiring a running stream here.
+        return False
+
+    def __repr__(self) -> str:
+        return (
+            f"AssertOnQuery(condition={_callable_label(self.condition)}, "
+            f"message={self.message!r})"
+        )
+
+
+class Execute(StreamAction):
+    """Run an arbitrary callback receiving the current ``StreamingQuery``.
+
+    Failures inside the callback are surfaced with the surrounding test
+    state, like any other framework error.
+    """
+
+    def __init__(
+        self,
+        func: Callable[[Any], None],
+        name: str = "Execute",
+    ) -> None:
+        self.func = func
+        self.name = name
+
+    @property
+    def requires_running_stream(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"Execute(func={_callable_label(self.func)}, name={self.name!r})"
+
+
+def _callable_label(fn: Any) -> str:
+    """Best-effort short label for ``fn`` to surface in error messages.
+
+    Reports ``module.qualname`` when available, otherwise falls back to
+    ``<lambda at file:line>`` or ``<callable>``.
+    """
+    qualname = getattr(fn, "__qualname__", None)
+    module = getattr(fn, "__module__", None)
+    code = getattr(fn, "__code__", None)
+    if code is not None:
+        loc = f"{code.co_filename}:{code.co_firstlineno}"
+    else:
+        loc = "<unknown>"
+    if qualname and not qualname.endswith("<lambda>") and module:
+        return f"{module}.{qualname} @ {loc}"
+    if qualname == "<lambda>" or (qualname and qualname.endswith("<lambda>")):
+        return f"<lambda @ {loc}>"
+    return repr(fn)
+
+
+__all__ = [
+    "StreamAction",
+    "StartStream",
+    "StopStream",
+    "AddData",
+    "ProcessAllAvailable",
+    "ExpectFailure",
+    "Assert",
+    "AssertOnQuery",
+    "Execute",
+]

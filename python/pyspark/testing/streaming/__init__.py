@@ -14,15 +14,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Testing helpers for PySpark Structured Streaming.
+"""A declarative testing framework for PySpark Structured Streaming.
 
-This package will host the Python port of Scala's ``StreamTest`` framework
-(see ``sql/core/src/test/scala/org/apache/spark/sql/streaming/StreamTest.scala``).
-The first step is a controllable in-memory streaming source: ``MemoryStream``.
-Subsequent commits add ``StreamTest``, lifecycle/assertion actions, and
-verification actions.
+This is the Python port of Scala's ``StreamTest`` -- see
+``sql/core/src/test/scala/org/apache/spark/sql/streaming/StreamTest.scala``
+for the reference implementation. Tests are written as a sequence of
+actions executed against a streaming DataFrame::
+
+    from pyspark.testing.streaming import (
+        StreamTest, MemoryStream, AddData, ProcessAllAvailable,
+    )
+
+    class MyStreamingTest(StreamTest):
+        def test_smoke(self):
+            source = MemoryStream(self.spark, "int")
+            self.run_stream_test(
+                source.to_df(),
+                AddData(source, 1, 2, 3),
+                ProcessAllAvailable(),
+            )
 """
 
+from pyspark.testing.streaming.actions import (
+    AddData,
+    Assert,
+    AssertOnQuery,
+    Execute,
+    ExpectFailure,
+    ProcessAllAvailable,
+    StartStream,
+    StopStream,
+    StreamAction,
+)
 from pyspark.testing.streaming.memory_stream import MemoryStream
+from pyspark.testing.streaming.stream_test import StreamTest
 
-__all__ = ["MemoryStream"]
+__all__ = [
+    "StreamTest",
+    "StreamAction",
+    "MemoryStream",
+    "AddData",
+    "StartStream",
+    "StopStream",
+    "ProcessAllAvailable",
+    "ExpectFailure",
+    "Assert",
+    "AssertOnQuery",
+    "Execute",
+]

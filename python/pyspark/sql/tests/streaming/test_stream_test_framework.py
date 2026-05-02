@@ -14,12 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Tests for the ``MemoryStream`` Python wrapper.
+"""Self-tests for the PySpark ``StreamTest`` framework.
 
-These tests exercise ``MemoryStream`` directly against the JVM bridge,
-without depending on the (forthcoming) ``StreamTest`` driver. They verify
-that data added from Python flows through the JVM memory source and lands
-in a ``writeStream.format("memory")`` sink.
+Covers the ``MemoryStream`` Python wrapper (driven directly against the
+JVM bridge with vanilla ``writeStream.format("memory")``) and the
+``StreamTest`` driver: lifecycle and assertion actions, the
+``CheckAnswer`` family with flexible expected-row shapes, and Real-Time
+Mode (``LowLatencyMemoryStream`` + ``ContinuousMemorySink`` +
+``Trigger.RealTime``). Each commit in the framework's PR stack adds the
+test classes for the API it introduces.
 """
 
 import os
@@ -27,11 +30,24 @@ import shutil
 import tempfile
 import time
 from collections import namedtuple
+from typing import Any, List
 
+from pyspark.errors import StreamingQueryException
 from pyspark.sql import Row
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 from pyspark.testing.sqlutils import ReusedSQLTestCase
-from pyspark.testing.streaming import MemoryStream
+from pyspark.testing.streaming import (
+    AddData,
+    Assert,
+    AssertOnQuery,
+    Execute,
+    ExpectFailure,
+    MemoryStream,
+    ProcessAllAvailable,
+    StartStream,
+    StopStream,
+    StreamTest,
+)
 
 
 class MemoryStreamTests(ReusedSQLTestCase):
@@ -176,6 +192,174 @@ class MemoryStreamTests(ReusedSQLTestCase):
         finally:
             query.stop()
             query.awaitTermination(60)
+
+
+# ---------------------------------------------------------------------------
+# StreamTest driver -- lifecycle & assertion actions
+# ---------------------------------------------------------------------------
+
+
+class StreamTestLifecycleTests(StreamTest):
+    """Tests for ``StreamTest``'s driver and lifecycle/assertion actions."""
+
+    def test_explicit_start_stream(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            StartStream(),
+            AddData(source, 1, 2),
+            ProcessAllAvailable(),
+        )
+
+    def test_auto_start_inserts_start_stream(self):
+        source = MemoryStream(self.spark, "int")
+        # No explicit StartStream -- the driver should insert one before
+        # the first action that requires a running stream.
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            ProcessAllAvailable(),
+        )
+
+    def test_stop_and_restart(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            ProcessAllAvailable(),
+            StopStream(),
+            AddData(source, 3),
+            StartStream(),
+            ProcessAllAvailable(),
+        )
+
+    def test_assert_on_query_active(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1),
+            AssertOnQuery(lambda q: q.isActive, "query should be active"),
+            ProcessAllAvailable(),
+            AssertOnQuery(
+                lambda q: q.lastProgress is not None,
+                "lastProgress should be populated after processing",
+            ),
+        )
+
+    def test_assert_on_query_after_stop(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1),
+            ProcessAllAvailable(),
+            StopStream(),
+            # AssertOnQuery sees the just-stopped query.
+            AssertOnQuery(lambda q: not q.isActive, "query should be stopped"),
+        )
+
+    def test_assert_callback(self):
+        flag: List[bool] = []
+
+        def set_flag() -> bool:
+            flag.append(True)
+            return True
+
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1),
+            Assert(set_flag, "side-effect should run"),
+            Assert(lambda: bool(flag), "side-effect should still be present"),
+        )
+        self.assertTrue(flag, "Assert callback should have executed")
+
+    def test_execute(self):
+        captured: List[Any] = []
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1),
+            ProcessAllAvailable(),
+            Execute(lambda q: captured.append(q.lastProgress), name="capture"),
+        )
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0])
+
+    def test_expect_failure(self):
+        source = MemoryStream(self.spark, "int")
+        # raise_error() deterministically fails the query regardless of the
+        # session's ANSI mode setting. The query thread surfaces a
+        # StreamingQueryException, which is what query.exception() returns.
+        df = source.to_df().selectExpr("raise_error('boom') as value")
+        captured: List[str] = []
+        self.run_stream_test(
+            df,
+            AddData(source, 1, 2, 3),
+            ExpectFailure(
+                StreamingQueryException,
+                assert_failure=lambda e: captured.append(str(e)),
+            ),
+        )
+        self.assertTrue(captured, "assert_failure callback should have run")
+        self.assertIn("boom", captured[0])
+
+    def test_assert_failure_includes_state_dump(self):
+        source = MemoryStream(self.spark, "int")
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                AddData(source, 1),
+                Assert(lambda: False, "always fails"),
+            )
+        msg = str(ctx.exception)
+        self.assertIn("Assert failed: always fails", msg)
+        # The progress trace should highlight the failing action.
+        self.assertIn("=> Assert", msg)
+
+    def test_batch_dataframe_rejected(self):
+        df = self.spark.range(3).toDF("value")
+        with self.assertRaises(ValueError):
+            self.run_stream_test(df, ProcessAllAvailable())
+
+    def test_assert_propagates_arbitrary_exception(self):
+        """A non-AssertionError raised inside Assert.condition must surface
+        with the original cause folded into the AssertionError message."""
+        source = MemoryStream(self.spark, "int")
+
+        def boom() -> bool:
+            raise RuntimeError("kaboom")
+
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                AddData(source, 1),
+                Assert(boom, "raises"),
+            )
+        msg = str(ctx.exception)
+        self.assertIn("Assert raised", msg)
+        self.assertIn("kaboom", msg)
+
+    def test_assert_on_query_after_expect_failure(self):
+        """After ExpectFailure, AssertOnQuery sees the just-failed query."""
+        source = MemoryStream(self.spark, "int")
+        df = source.to_df().selectExpr("raise_error('boom') as value")
+        captured: List[str] = []
+
+        def has_exception(q) -> bool:
+            exc = q.exception()
+            if exc is None:
+                return False
+            captured.append(str(exc))
+            return True
+
+        self.run_stream_test(
+            df,
+            AddData(source, 1),
+            ExpectFailure(StreamingQueryException),
+            AssertOnQuery(has_exception, "captured query failure"),
+        )
+        self.assertTrue(captured)
+        self.assertIn("boom", captured[0])
 
 
 if __name__ == "__main__":
