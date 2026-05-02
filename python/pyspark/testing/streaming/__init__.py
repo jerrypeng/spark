@@ -34,6 +34,11 @@ actions executed against a streaming DataFrame::
                 AddData(source, 1, 2, 3),
                 CheckAnswer(2, 4, 6),
             )
+
+For Real-Time Mode (RTM) tests, pair ``LowLatencyMemoryStream`` with
+``ContinuousMemorySink`` and the ``trigger={"realTime": "..."}`` option;
+``CheckAnswerWithTimeout`` polls the sink instead of waiting on
+``processAllAvailable`` (which is not meaningful under RTM).
 """
 
 from pyspark.testing.streaming.actions import (
@@ -42,22 +47,29 @@ from pyspark.testing.streaming.actions import (
     AssertOnQuery,
     CheckAnswer,
     CheckAnswerByFunc,
+    CheckAnswerContainsWithTimeout,
+    CheckAnswerWithTimeout,
     CheckLastBatch,
     CheckNewAnswer,
     Execute,
     ExpectFailure,
+    ExternalAction,
     ProcessAllAvailable,
+    Sleep,
     StartStream,
     StopStream,
     StreamAction,
 )
 from pyspark.testing.streaming.memory_stream import MemoryStream
+from pyspark.testing.streaming.rtm import ContinuousMemorySink, LowLatencyMemoryStream
 from pyspark.testing.streaming.stream_test import StreamTest
 
 __all__ = [
     "StreamTest",
     "StreamAction",
     "MemoryStream",
+    "LowLatencyMemoryStream",
+    "ContinuousMemorySink",
     "AddData",
     "StartStream",
     "StopStream",
@@ -66,8 +78,12 @@ __all__ = [
     "Assert",
     "AssertOnQuery",
     "Execute",
+    "ExternalAction",
+    "Sleep",
     "CheckAnswer",
     "CheckLastBatch",
     "CheckNewAnswer",
     "CheckAnswerByFunc",
+    "CheckAnswerWithTimeout",
+    "CheckAnswerContainsWithTimeout",
 ]

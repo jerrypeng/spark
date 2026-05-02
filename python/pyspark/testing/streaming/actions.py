@@ -30,6 +30,7 @@ from pyspark.sql import Row
 from pyspark.sql.types import StructType
 from pyspark.testing.streaming._conversions import to_rows
 from pyspark.testing.streaming.memory_stream import MemoryStream
+from pyspark.testing.streaming.rtm import LowLatencyMemoryStream
 
 
 class StreamAction(ABC):
@@ -98,20 +99,24 @@ class StopStream(StreamAction):
 
 
 class AddData(StreamAction):
-    """Append data to a ``MemoryStream`` source.
+    """Append data to a ``MemoryStream`` or ``LowLatencyMemoryStream``.
 
     Parameters
     ----------
-    source : MemoryStream
-        The stream to append to.
+    source : MemoryStream or LowLatencyMemoryStream
+        The stream to append to. ``LowLatencyMemoryStream`` is the
+        RTM-capable source; the standard ``MemoryStream`` is rejected
+        under ``Trigger.RealTime`` queries (see
+        :class:`pyspark.testing.streaming.rtm.LowLatencyMemoryStream`).
     *data
         Rows to add. Same flexibility as ``MemoryStream.add_data``.
     """
 
-    def __init__(self, source: MemoryStream, *data: Any) -> None:
-        if not isinstance(source, MemoryStream):
+    def __init__(self, source: Any, *data: Any) -> None:
+        if not isinstance(source, (MemoryStream, LowLatencyMemoryStream)):
             raise TypeError(
-                f"AddData source must be a MemoryStream, got {type(source).__name__}"
+                f"AddData source must be a MemoryStream or LowLatencyMemoryStream, "
+                f"got {type(source).__name__}"
             )
         self.source = source
         self.data = data
@@ -375,6 +380,115 @@ class CheckAnswerByFunc(StreamAction):
         return f"{kind}()"
 
 
+# ---------------------------------------------------------------------------
+# RTM (Real-Time Mode) actions
+# ---------------------------------------------------------------------------
+
+
+class CheckAnswerWithTimeout(_CheckActionBase):
+    """Poll the sink until the expected rows match, or fail after ``timeout_ms``.
+
+    Used with ``trigger={"realTime": "<duration>"}`` and a
+    :class:`pyspark.testing.streaming.rtm.ContinuousMemorySink`. RTM batches
+    run on fixed time intervals so ``processAllAvailable`` is not meaningful;
+    this action repeatedly fetches the sink and compares against the
+    expected rows until either the multiset matches or the timeout expires.
+
+    Mirrors Scala's ``CheckAnswerRowsNoWait`` /
+    ``CheckAnswerRowsContainsWithTimeout`` family of actions.
+
+    Parameters
+    ----------
+    timeout_ms : int
+        Maximum time in milliseconds to poll for the expected answer.
+    *data
+        Expected rows; same flexible types as ``CheckAnswer``.
+    """
+
+    def __init__(self, timeout_ms: int, *data: Any, ordered: bool = False) -> None:
+        super().__init__(*data, ordered=ordered)
+        if timeout_ms <= 0:
+            raise ValueError(f"timeout_ms must be > 0, got {timeout_ms}")
+        if not data:
+            raise ValueError(
+                "CheckAnswerWithTimeout requires at least one expected row "
+                "(an empty multiset matches the empty sink instantly, which "
+                "is almost never the user's intent for a polling check)."
+            )
+        self.timeout_ms = int(timeout_ms)
+
+    def __repr__(self) -> str:
+        return (
+            f"CheckAnswerWithTimeout(timeout_ms={self.timeout_ms}, "
+            f"data={self._raw_data})"
+        )
+
+
+class CheckAnswerContainsWithTimeout(_CheckActionBase):
+    """Poll the sink until ``data`` is a multiset *subset* of the actual rows.
+
+    Like :class:`CheckAnswerWithTimeout`, but the expected rows must merely
+    be present -- extra rows in the sink are tolerated. RTM batches can flush
+    additional rows beyond the assertion's interest; this action handles
+    that by checking subset membership rather than equality.
+
+    Mirrors Scala's ``CheckAnswerRowsContainsWithTimeout``.
+    """
+
+    def __init__(self, timeout_ms: int, *data: Any) -> None:
+        super().__init__(*data, ordered=False)
+        if timeout_ms <= 0:
+            raise ValueError(f"timeout_ms must be > 0, got {timeout_ms}")
+        if not data:
+            raise ValueError(
+                "CheckAnswerContainsWithTimeout requires at least one "
+                "expected row (an empty multiset is trivially a subset)."
+            )
+        self.timeout_ms = int(timeout_ms)
+
+    def __repr__(self) -> str:
+        return (
+            f"CheckAnswerContainsWithTimeout(timeout_ms={self.timeout_ms}, "
+            f"data={self._raw_data})"
+        )
+
+
+class ExternalAction(StreamAction):
+    """Execute an arbitrary side-effecting zero-arg callable.
+
+    Like :class:`Execute` but does not receive the streaming query -- useful
+    for sleeping, advancing a manual clock, or triggering external state
+    needed by the test (mirrors Scala's ``ExternalAction``).
+    """
+
+    def __init__(self, func: Callable[[], None], name: str = "ExternalAction") -> None:
+        self.func = func
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"ExternalAction(func={_callable_label(self.func)}, name={self.name!r})"
+
+
+class Sleep(ExternalAction):
+    """Sleep for ``seconds`` seconds.
+
+    Convenience wrapper around :class:`ExternalAction` for RTM tests that
+    need to let real wall-clock time pass for batch boundaries to fire.
+    Avoid in non-RTM tests; use ``ProcessAllAvailable`` instead.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError(f"seconds must be >= 0, got {seconds}")
+        self.seconds = float(seconds)
+
+        import time as _time
+        super().__init__(lambda: _time.sleep(self.seconds), name=f"Sleep({self.seconds}s)")
+
+    def __repr__(self) -> str:
+        return f"Sleep({self.seconds}s)"
+
+
 __all__ = [
     "StreamAction",
     "StartStream",
@@ -389,4 +503,8 @@ __all__ = [
     "CheckLastBatch",
     "CheckNewAnswer",
     "CheckAnswerByFunc",
+    "CheckAnswerWithTimeout",
+    "CheckAnswerContainsWithTimeout",
+    "ExternalAction",
+    "Sleep",
 ]

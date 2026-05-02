@@ -46,10 +46,13 @@ from pyspark.testing.streaming.actions import (
     AssertOnQuery,
     CheckAnswer,
     CheckAnswerByFunc,
+    CheckAnswerContainsWithTimeout,
+    CheckAnswerWithTimeout,
     CheckLastBatch,
     CheckNewAnswer,
     Execute,
     ExpectFailure,
+    ExternalAction,
     ProcessAllAvailable,
     StartStream,
     StopStream,
@@ -136,13 +139,16 @@ class StreamTest(unittest.TestCase):
         *actions: StreamAction,
         output_mode: str = "append",
         extra_options: Optional[Dict[str, str]] = None,
+        sink: Optional[Any] = None,
     ) -> None:
         """Execute ``actions`` against the streaming DataFrame ``stream``.
 
-        Drives a ``writeStream.format("memory")`` query and walks the
-        action list synchronously. Auto-inserts ``StartStream`` if the
-        sequence does not begin with one and the first action that needs
-        a running stream comes before any explicit start.
+        Drives a ``writeStream.format("memory")`` query (or, when ``sink`` is
+        provided, an explicit-sink query started via the JVM
+        ``startStreamingQueryWithSink`` helper) and walks the action list
+        synchronously. Auto-inserts ``StartStream`` if the sequence does not
+        begin with one and the first action that needs a running stream
+        comes before any explicit start.
 
         Parameters
         ----------
@@ -154,6 +160,11 @@ class StreamTest(unittest.TestCase):
             ``"append"`` (default), ``"complete"`` or ``"update"``.
         extra_options
             Extra options applied to every ``writeStream`` invocation.
+        sink
+            Optional custom sink. Pass a
+            :class:`pyspark.testing.streaming.rtm.ContinuousMemorySink` for
+            RTM tests; the driver will route Check actions through the sink
+            object directly instead of through the memory format table.
         """
         if not stream.isStreaming:
             raise ValueError(
@@ -161,7 +172,9 @@ class StreamTest(unittest.TestCase):
                 "DataFrame. Build one with MemoryStream.to_df() or "
                 "spark.readStream..."
             )
-        runner = _Runner(self, stream, list(actions), output_mode, extra_options or {})
+        runner = _Runner(
+            self, stream, list(actions), output_mode, extra_options or {}, sink
+        )
         runner.run()
 
 
@@ -302,12 +315,31 @@ class _Runner:
         actions: List[StreamAction],
         output_mode: str,
         extra_options: Dict[str, str],
+        custom_sink: Optional[Any] = None,
     ) -> None:
         self.test = test
         self.stream = stream
         self.output_mode = output_mode
         self.extra_options = extra_options
         self.output_schema: StructType = stream.schema
+        # When set, query starts via ``startStreamingQueryWithSink`` and Check
+        # actions read directly from the supplied sink object instead of from
+        # the format("memory") table. Required for RTM tests.
+        self.custom_sink: Optional[Any] = custom_sink
+        if self.custom_sink is not None:
+            if hasattr(self.custom_sink, "set_schema"):
+                self.custom_sink.set_schema(self.output_schema)
+            # Wipe any rows left over from a prior ``run_stream_test`` so
+            # tests that reuse a sink (e.g. across helper methods) don't
+            # see stale data.
+            if hasattr(self.custom_sink, "clear"):
+                try:
+                    self.custom_sink.clear()
+                except Exception:
+                    logger.exception(
+                        "Failed to clear custom sink before run_stream_test; "
+                        "stale rows may bleed into this test"
+                    )
 
         # A per-test query name so multiple tests can run with disjoint
         # memory-sink tables. The pid + monotonic ns ensure uniqueness
@@ -383,6 +415,122 @@ class _Runner:
         if not condition:
             self._fail(message)
 
+    # ----- trigger / custom-sink helpers -------------------------------
+
+    # Trigger keys this framework recognizes. Anything else is rejected
+    # explicitly so a misspelling or an unsupported feature (e.g.
+    # ``continuous=...``) does not silently fall through to the
+    # ProcessingTime(0) default or ``DataStreamWriter.trigger``'s own
+    # less-friendly TypeError.
+    _SUPPORTED_TRIGGER_KEYS = frozenset(
+        {"realTime", "processingTime", "once", "availableNow"}
+    )
+
+    @classmethod
+    def _writer_trigger_kwargs(cls, trigger: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate the framework's trigger dict into ``DataStreamWriter.trigger``
+        keyword arguments. The ``realTime`` key is RTM-specific and must be
+        applied through the explicit-sink path; reject it here so users get a
+        clear error if they try to use it without a custom sink. Other
+        validation (unknown keys, multiple keys, falsy flag values) is shared
+        with the custom-sink path via :meth:`_validate_trigger_keys`.
+        """
+        if "realTime" in trigger:
+            raise ValueError(
+                "trigger={'realTime': ...} requires sink= to be a "
+                "ContinuousMemorySink (or another RTM-compatible sink). "
+                "RTM cannot use the standard format(\"memory\") sink."
+            )
+        cls._validate_trigger_keys(trigger)
+        return dict(trigger)
+
+    def _jvm_trigger(self, trigger: Optional[Dict[str, Any]]) -> Any:
+        """Build a JVM ``Trigger`` from the framework's trigger dict for the
+        explicit-sink (RTM) path. Defaults to ``ProcessingTime(0)`` when no
+        trigger is supplied. Rejects unknown trigger keys, multiple keys,
+        and falsy values for ``once`` / ``availableNow``."""
+        jvm = self.test.spark._jvm  # type: ignore[attr-defined]
+        if trigger:
+            self._validate_trigger_keys(trigger)
+        if trigger and "realTime" in trigger:
+            duration = trigger["realTime"]
+            py_utils = jvm.org.apache.spark.sql.api.python.PythonSQLUtils
+            # Delegate duration parsing to the JVM so we accept exactly the
+            # same shapes as Scala's ``RealTimeTrigger.apply``: int (ms)
+            # or string ("4 seconds", "200 ms", ...).
+            if isinstance(duration, bool):  # bool is an int subclass
+                raise TypeError(
+                    f"realTime duration must be int or str, got bool: {duration!r}"
+                )
+            if isinstance(duration, int):
+                if duration <= 0:
+                    raise ValueError(
+                        f"realTime duration must be > 0 ms, got {duration}"
+                    )
+                return py_utils.realTimeTrigger(int(duration))
+            if isinstance(duration, str):
+                return py_utils.realTimeTriggerFromString(duration)
+            raise TypeError(
+                f"realTime duration must be int or str, got "
+                f"{type(duration).__name__}"
+            )
+        if trigger and "processingTime" in trigger:
+            return jvm.org.apache.spark.sql.streaming.Trigger.ProcessingTime(
+                trigger["processingTime"]
+            )
+        if trigger and "once" in trigger:
+            return jvm.org.apache.spark.sql.streaming.Trigger.Once()
+        if trigger and "availableNow" in trigger:
+            return jvm.org.apache.spark.sql.streaming.Trigger.AvailableNow()
+        return jvm.org.apache.spark.sql.streaming.Trigger.ProcessingTime("0 seconds")
+
+    @classmethod
+    def _validate_trigger_keys(cls, trigger: Dict[str, Any]) -> None:
+        """Reject unknown keys, multiple keys, and falsy ``once`` /
+        ``availableNow`` values. Shared by the standard (writer) and
+        custom-sink (RTM) trigger paths."""
+        unknown = set(trigger).difference(cls._SUPPORTED_TRIGGER_KEYS)
+        if unknown:
+            raise ValueError(
+                f"Unsupported trigger keys: {sorted(unknown)}. "
+                f"Supported: {sorted(cls._SUPPORTED_TRIGGER_KEYS)}."
+            )
+        present = sorted(set(trigger).intersection(cls._SUPPORTED_TRIGGER_KEYS))
+        if len(present) > 1:
+            raise ValueError(
+                f"Exactly one trigger key is allowed; got {present}."
+            )
+        # ``once`` / ``availableNow`` are flag triggers; the value must
+        # be exactly True. Falsy values (None, False, 0, "") would
+        # otherwise be silently demoted to the ProcessingTime(0) default.
+        for flag in ("once", "availableNow"):
+            if flag in trigger and trigger[flag] is not True:
+                raise ValueError(
+                    f"trigger[{flag!r}] must be exactly True, got {trigger[flag]!r}"
+                )
+
+    def _start_with_custom_sink(
+        self,
+        trigger: Optional[Dict[str, Any]],
+        checkpoint: str,
+        opts: Dict[str, str],
+    ) -> Any:
+        spark = self.test.spark
+        jvm = spark._jvm  # type: ignore[attr-defined]
+        py_utils = jvm.org.apache.spark.sql.api.python.PythonSQLUtils
+        jopts = jvm.java.util.HashMap()
+        for k, v in opts.items():
+            jopts.put(k, v)
+        return py_utils.startStreamingQueryWithSink(
+            spark._jsparkSession,  # type: ignore[attr-defined]
+            self.stream._jdf,  # type: ignore[attr-defined]
+            self.custom_sink._jsink,  # type: ignore[attr-defined]
+            self.output_mode,
+            checkpoint,
+            self._jvm_trigger(trigger),
+            jopts,
+        )
+
     # ----- query lifecycle ---------------------------------------------
 
     def _start_query(
@@ -408,21 +556,31 @@ class _Runner:
 
         previous_query = self.current_query
 
-        writer = (
-            self.stream.writeStream.outputMode(self.output_mode)
-            .format("memory")
-            .queryName(self.query_name)
-            .option("checkpointLocation", chk)
-        )
-        for k, v in {**self.extra_options, **(opts or {})}.items():
-            writer = writer.option(k, v)
         trigger_conf = trigger or self.test.default_trigger
-        if trigger_conf:
-            writer = writer.trigger(**trigger_conf)
-        # Defer the ``last_query`` swap until after ``writer.start()``
-        # succeeds; otherwise an analyzer error in start() would orphan
-        # the previous query while clobbering the trace.
-        self.current_query = writer.start()
+        merged_opts = {**self.extra_options, **(opts or {})}
+
+        if self.custom_sink is not None:
+            # RTM / custom-sink path: route through the JVM
+            # ``startStreamingQueryWithSink`` helper so the test-supplied
+            # sink instance is wired to the streaming query.
+            jquery = self._start_with_custom_sink(trigger_conf, chk, merged_opts)
+            from pyspark.sql.streaming.query import StreamingQuery
+
+            # Defer the ``last_query`` swap until after the JVM call
+            # returns successfully (see PR 2 commit message for context).
+            self.current_query = StreamingQuery(jquery)
+        else:
+            writer = (
+                self.stream.writeStream.outputMode(self.output_mode)
+                .format("memory")
+                .queryName(self.query_name)
+                .option("checkpointLocation", chk)
+            )
+            for k, v in merged_opts.items():
+                writer = writer.option(k, v)
+            if trigger_conf:
+                writer = writer.trigger(**self._writer_trigger_kwargs(trigger_conf))
+            self.current_query = writer.start()
         if previous_query is not None:
             self.last_query = previous_query
         # Note: do NOT reset ``_last_fetched_rows`` unconditionally here. For
@@ -436,7 +594,11 @@ class _Runner:
         # restart Check actions work against the new sink from scratch.
         if self.output_mode != "append":
             self._last_fetched_rows = 0
-        self.sink_reader.attach(self.current_query._jsq)  # type: ignore[attr-defined]
+        if self.custom_sink is None:
+            self.sink_reader.attach(
+                self.current_query._jsq  # type: ignore[attr-defined]
+            )
+
 
         # Wait briefly for the query thread to come up. If it dies before
         # initialization (e.g. analyzer error), surface that quickly.
@@ -489,13 +651,27 @@ class _Runner:
     def _fetch_all(self) -> List[Row]:
         self._verify(self.current_query is not None, "Stream not running")
         self._wait_for_processing()
-        rows = self.sink_reader.all_data()
+        if self.custom_sink is not None:
+            rows = self.custom_sink.all_data()
+        else:
+            rows = self.sink_reader.all_data()
         # Advance the cumulative cursor so a subsequent CheckNewAnswer only
         # reports rows added *after* this CheckAnswer / CheckAnswerByFunc.
         # Mirrors Scala's fetchStreamAnswer which always updates
         # lastFetchedMemorySinkLastBatchId.
         self._last_fetched_rows = len(rows)
         return rows
+
+    def _poll_sink(self, timeout_ms: int) -> List[Row]:
+        """Snapshot the sink rows without waiting on ``processAllAvailable``.
+
+        Used by ``CheckAnswerWithTimeout`` / ``CheckAnswerContainsWithTimeout``
+        for RTM tests where ``processAllAvailable`` is not meaningful.
+        ``timeout_ms`` is unused here; the caller drives the polling loop.
+        """
+        if self.custom_sink is not None:
+            return self.custom_sink.all_data()
+        return self.sink_reader.all_data()
 
     def _fetch_new(self) -> List[Row]:
         """Rows added since the previous Check action consumed the sink.
@@ -506,6 +682,23 @@ class _Runner:
         batches into a single sink batch, so batch ids aren't stable across
         a restart, but the cumulative row order is.
         """
+        if self.custom_sink is not None:
+            self._fail(
+                "CheckNewAnswer is not supported with a custom sink (e.g. "
+                "ContinuousMemorySink for RTM); use CheckAnswerWithTimeout "
+                "for cumulative checks against the polling sink."
+            )
+        if self.output_mode != "append":
+            # In complete / update modes the MemorySink truncates per batch,
+            # so the cumulative row count is not monotone and positional
+            # slicing produces wrong (often empty) results. Reject loudly
+            # rather than silently returning the empty multiset.
+            self._fail(
+                f"CheckNewAnswer is not supported with output_mode="
+                f"{self.output_mode!r}; the memory sink truncates per batch "
+                f"and the cumulative-row cursor cannot be reasoned about. "
+                f"Use CheckAnswer (which inspects the full sink) instead."
+            )
         # Capture the cursor *before* ``_fetch_all`` advances it.
         previous = self._last_fetched_rows
         all_rows = self._fetch_all()
@@ -520,6 +713,13 @@ class _Runner:
         committed yet so the user gets a clear error rather than an
         empty-actual diff.
         """
+        if self.custom_sink is not None:
+            self._fail(
+                "CheckLastBatch / CheckLastBatchByFunc is not supported with "
+                "a custom sink (e.g. ContinuousMemorySink for RTM); "
+                "ContinuousMemorySink does not expose batch ids. Use "
+                "CheckAnswerWithTimeout / CheckAnswerContainsWithTimeout."
+            )
         self._verify(self.current_query is not None, "Stream not running")
         self._wait_for_processing()
         latest = self.sink_reader.latest_batch_id()
@@ -543,6 +743,87 @@ class _Runner:
         diff = _diff_rows(expected, actual, action.ordered)
         if diff:
             self._fail(diff)
+
+    def _check_with_timeout(
+        self,
+        action: _CheckActionBase,
+        *,
+        contains: bool,
+    ) -> None:
+        """Poll the sink until the expected rows match (or are contained),
+        or fail when ``timeout_ms`` expires.
+
+        Used by ``CheckAnswerWithTimeout`` and ``CheckAnswerContainsWithTimeout``
+        for RTM tests where ``processAllAvailable`` is not meaningful. Aborts
+        early if the query terminates with an exception so failures point at
+        the real cause instead of an opaque timeout.
+        """
+        self._verify(self.current_query is not None, "Stream not running")
+        timeout_ms = action.timeout_ms  # type: ignore[attr-defined]
+        expected = action.resolve_expected(self.output_schema)
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        # Cap the poll interval at the default 100 ms but scale down for
+        # short timeouts so a sub-100 ms timeout still polls more than once.
+        # 5 polls minimum (timeout_ms/5/1000 in seconds), default 100 ms.
+        poll_interval = min(0.1, timeout_ms / 5_000.0)
+        last_diff: Optional[str] = None
+        while time.monotonic() < deadline:
+            actual = self._poll_sink(timeout_ms)
+            if contains:
+                last_diff = _diff_contains(expected, actual)
+            else:
+                last_diff = _diff_rows(expected, actual, action.ordered)
+            if last_diff is None:
+                # Advance the cumulative cursor so a follow-up CheckNewAnswer
+                # (on the standard path) only sees rows added after this
+                # check. RTM (custom_sink) explicitly rejects CheckNewAnswer,
+                # but this keeps the standard path's invariant intact for
+                # tests that mix the action with format("memory").
+                self._last_fetched_rows = len(actual)
+                return
+            # Fail fast on a dead query -- burning the full timeout while the
+            # JVM-side query has crashed turns every RTM bug into an opaque
+            # "timed out" report.
+            if not self.current_query.isActive:
+                exc = self.current_query.exception()
+                if exc is not None:
+                    self._fail(
+                        f"{type(action).__name__}: query terminated with "
+                        f"exception during poll: {exc}"
+                    )
+                # Inactive without exception (e.g. trigger=Once finished) --
+                # one more synchronous poll to capture any rows committed in
+                # the same instant the query was finishing -- not a "flush
+                # window", since there's no sleep here.
+                actual = self._poll_sink(timeout_ms)
+                last_diff = (
+                    _diff_contains(expected, actual) if contains
+                    else _diff_rows(expected, actual, action.ordered)
+                )
+                if last_diff is None:
+                    self._last_fetched_rows = len(actual)
+                    return
+                self._fail(
+                    f"{type(action).__name__}: query terminated cleanly "
+                    f"before producing the expected rows.\n"
+                    f"{last_diff}"
+                )
+            time.sleep(poll_interval)
+        # Final liveness check after the deadline expires: if the query
+        # crashed in the gap between the last in-loop check and the
+        # deadline, surface that exception rather than reporting an
+        # opaque timeout.
+        if not self.current_query.isActive:
+            exc = self.current_query.exception()
+            if exc is not None:
+                self._fail(
+                    f"{type(action).__name__}: query terminated with "
+                    f"exception during poll: {exc}"
+                )
+        self._fail(
+            f"{type(action).__name__} timed out after {timeout_ms}ms.\n"
+            f"{last_diff or '<no diff captured>'}"
+        )
 
     # ----- action dispatch ---------------------------------------------
 
@@ -591,6 +872,23 @@ class _Runner:
                 raise
             except BaseException as e:  # noqa: BLE001
                 self._fail(f"CheckAnswerByFunc raised: {e}", e)
+            return
+
+        if isinstance(action, CheckAnswerWithTimeout):
+            self._check_with_timeout(action, contains=False)
+            return
+
+        if isinstance(action, CheckAnswerContainsWithTimeout):
+            self._check_with_timeout(action, contains=True)
+            return
+
+        if isinstance(action, ExternalAction):
+            try:
+                action.func()
+            except AssertionError:
+                raise
+            except BaseException as e:  # noqa: BLE001
+                self._fail(f"ExternalAction({action.name!r}) raised: {e}", e)
             return
 
         if isinstance(action, ExpectFailure):
@@ -712,6 +1010,34 @@ class _Runner:
                 self.test.spark.sql(f"DROP TABLE IF EXISTS {self.query_name}")
             except Exception:
                 logger.exception("Failed to drop sink table %s", self.query_name)
+
+
+def _diff_contains(expected: List[Row], actual: List[Row]) -> Optional[str]:
+    """Multiset subset check: every expected row must appear in ``actual``.
+
+    Returns ``None`` when ``expected`` is a multiset subset of ``actual``,
+    else a formatted error message listing the missing rows.
+    """
+    try:
+        e_counter: Counter = Counter(expected)
+        a_counter: Counter = Counter(actual)
+        missing = e_counter - a_counter
+        missing_rows = list(missing.elements())
+    except TypeError:
+        actual_remaining = list(actual)
+        missing_rows = []
+        for row in expected:
+            try:
+                actual_remaining.remove(row)
+            except ValueError:
+                missing_rows.append(row)
+    if not missing_rows:
+        return None
+    return (
+        f"Expected rows not found in actual output.\n"
+        f"Missing ({len(missing_rows)}):\n{_format_rows(missing_rows)}\n"
+        f"Actual ({len(actual)} rows):\n{_format_rows(actual)}"
+    )
 
 
 def _exception_matches(exc: BaseException, exc_type: type) -> bool:

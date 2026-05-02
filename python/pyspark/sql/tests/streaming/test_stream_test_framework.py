@@ -43,12 +43,18 @@ from pyspark.testing.streaming import (
     AssertOnQuery,
     CheckAnswer,
     CheckAnswerByFunc,
+    CheckAnswerContainsWithTimeout,
+    CheckAnswerWithTimeout,
     CheckLastBatch,
     CheckNewAnswer,
+    ContinuousMemorySink,
     Execute,
     ExpectFailure,
+    ExternalAction,
+    LowLatencyMemoryStream,
     MemoryStream,
     ProcessAllAvailable,
+    Sleep,
     StartStream,
     StopStream,
     StreamTest,
@@ -692,6 +698,172 @@ class CheckActionErrorReportingTests(StreamTest):
         self.assertIn("Unexpected rows", msg)
         # The progress trace should mark the failing action.
         self.assertIn("=> CheckAnswer", msg)
+
+
+# ---------------------------------------------------------------------------
+# Real-Time Mode (RTM)
+# ---------------------------------------------------------------------------
+
+
+class RtmTests(StreamTest):
+    """Tests covering ``LowLatencyMemoryStream`` + ``ContinuousMemorySink`` + RTM trigger."""
+
+    streaming_timeout_seconds = 30.0
+    # Allow sub-5-second RTM batch durations for fast tests. The default
+    # production minimum is 5000 ms which would make these tests slow.
+    spark_conf = {"spark.sql.streaming.realTimeMode.minBatchDuration": "100"}
+
+    def test_low_latency_memory_stream_smoke(self):
+        """LowLatencyMemoryStream + ContinuousMemorySink + Trigger.RealTime end-to-end.
+
+        Uses the polling Check action (RTM batches run on wall-clock
+        intervals; processAllAvailable is a no-op).
+        """
+        source = LowLatencyMemoryStream(self.spark, "int", num_partitions=2)
+        sink = ContinuousMemorySink(self.spark)
+        df = source.to_df()
+        self.run_stream_test(
+            df,
+            StartStream(trigger={"realTime": "200 milliseconds"}),
+            AddData(source, 1, 2, 3),
+            CheckAnswerWithTimeout(10_000, 1, 2, 3),
+            output_mode="update",
+            sink=sink,
+        )
+
+    def test_check_answer_contains_with_timeout(self):
+        """Subset check: extra rows in the sink are tolerated."""
+        source = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        sink = ContinuousMemorySink(self.spark)
+        self.run_stream_test(
+            source.to_df(),
+            StartStream(trigger={"realTime": "200 milliseconds"}),
+            AddData(source, 1, 2, 3, 4, 5),
+            CheckAnswerContainsWithTimeout(10_000, 2, 4),
+            output_mode="update",
+            sink=sink,
+        )
+
+    def test_realtime_trigger_requires_custom_sink(self):
+        """``trigger={"realTime": ...}`` without a ``sink=`` is a clear error.
+
+        The driver wraps the validation error in an AssertionError with
+        the action progress trace, so the test checks for the wrapped form.
+        """
+        source = LowLatencyMemoryStream(self.spark, "int")
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                StartStream(trigger={"realTime": "200 milliseconds"}),
+                AddData(source, 1),
+                ProcessAllAvailable(),
+            )
+        self.assertIn("ContinuousMemorySink", str(ctx.exception))
+
+    def test_external_action_runs(self):
+        captured: List[str] = []
+        source = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        sink = ContinuousMemorySink(self.spark)
+        self.run_stream_test(
+            source.to_df(),
+            StartStream(trigger={"realTime": "200 milliseconds"}),
+            AddData(source, 1),
+            ExternalAction(lambda: captured.append("ran"), name="capture"),
+            CheckAnswerWithTimeout(10_000, 1),
+            output_mode="update",
+            sink=sink,
+        )
+        self.assertEqual(captured, ["ran"])
+
+    def test_sleep_action(self):
+        source = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        sink = ContinuousMemorySink(self.spark)
+        self.run_stream_test(
+            source.to_df(),
+            StartStream(trigger={"realTime": "100 milliseconds"}),
+            AddData(source, 1),
+            Sleep(0.2),
+            CheckAnswerWithTimeout(10_000, 1),
+            output_mode="update",
+            sink=sink,
+        )
+
+    def test_low_latency_memory_stream_rejects_zero_partitions(self):
+        with self.assertRaises(ValueError):
+            LowLatencyMemoryStream(self.spark, "int", num_partitions=0)
+
+    def test_check_answer_with_timeout_validates_timeout(self):
+        with self.assertRaises(ValueError):
+            CheckAnswerWithTimeout(0, 1)
+
+    def test_sleep_validates_seconds(self):
+        with self.assertRaises(ValueError):
+            Sleep(-1)
+
+    def test_check_answer_with_timeout_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            CheckAnswerWithTimeout(1000)
+
+    def test_check_answer_contains_with_timeout_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            CheckAnswerContainsWithTimeout(1000)
+
+    def test_check_last_batch_rejected_with_custom_sink(self):
+        """CheckLastBatch on the custom-sink path must give a clear framework
+        error rather than crashing inside ContinuousMemorySink.dataSinceBatch."""
+        source = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        sink = ContinuousMemorySink(self.spark)
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                StartStream(trigger={"realTime": "200 milliseconds"}),
+                AddData(source, 1),
+                CheckLastBatch(1),
+                output_mode="update",
+                sink=sink,
+            )
+        self.assertIn("not supported with a custom sink", str(ctx.exception))
+
+    def test_check_new_answer_rejected_with_custom_sink(self):
+        """CheckNewAnswer on the custom-sink path must give a clear framework error."""
+        source = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        sink = ContinuousMemorySink(self.spark)
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                StartStream(trigger={"realTime": "200 milliseconds"}),
+                AddData(source, 1),
+                CheckNewAnswer(1),
+                output_mode="update",
+                sink=sink,
+            )
+        self.assertIn("not supported with a custom sink", str(ctx.exception))
+
+    def test_sink_cleared_on_reuse(self):
+        """Reusing the same ContinuousMemorySink across run_stream_test
+        invocations must not bleed rows from the prior run."""
+        source1 = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        source2 = LowLatencyMemoryStream(self.spark, "int", num_partitions=1)
+        sink = ContinuousMemorySink(self.spark)
+        self.run_stream_test(
+            source1.to_df(),
+            StartStream(trigger={"realTime": "200 milliseconds"}),
+            AddData(source1, 100, 200),
+            CheckAnswerWithTimeout(10_000, 100, 200),
+            output_mode="update",
+            sink=sink,
+        )
+        # Without clear() on the second run, the new sink would still hold
+        # 100 and 200 from the first run and CheckAnswerWithTimeout(1, 2)
+        # would fail with "unexpected rows: 100, 200".
+        self.run_stream_test(
+            source2.to_df(),
+            StartStream(trigger={"realTime": "200 milliseconds"}),
+            AddData(source2, 1, 2),
+            CheckAnswerWithTimeout(10_000, 1, 2),
+            output_mode="update",
+            sink=sink,
+        )
 
 
 if __name__ == "__main__":

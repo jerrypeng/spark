@@ -341,6 +341,155 @@ private[sql] object PythonSQLUtils extends Logging {
     memorySinkOf(query).latestBatchId.map(java.lang.Long.valueOf).orNull
   }
 
+  // ---------------------------------------------------------------------------
+  // Real-Time Mode (RTM) helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a [[org.apache.spark.sql.execution.streaming.LowLatencyMemoryStream]]
+   * of `Row` values for use by the PySpark `StreamTest` framework with
+   * `Trigger.RealTime`.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def createLowLatencyMemoryStream(
+      sparkSession: SparkSession,
+      schema: StructType,
+      numPartitions: Int): AnyRef = {
+    import org.apache.spark.sql.execution.streaming.LowLatencyMemoryStream
+    implicit val enc: ExpressionEncoder[Row] = ExpressionEncoder(schema)
+    LowLatencyMemoryStream[Row](sparkSession, numPartitions)
+  }
+
+  /**
+   * Append the rows of `dataDF` to a low-latency memory stream returned from
+   * [[createLowLatencyMemoryStream]].
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def lowLatencyMemoryStreamAddData(memoryStream: AnyRef, dataDF: DataFrame): Unit = {
+    import org.apache.spark.sql.execution.streaming.LowLatencyMemoryStream
+    val stream = memoryStream.asInstanceOf[LowLatencyMemoryStream[Row]]
+    val rows = dataDF.collect().toSeq
+    stream.addData(rows)
+  }
+
+  /**
+   * Returns a streaming [[DataFrame]] backed by the low-latency memory stream
+   * returned from [[createLowLatencyMemoryStream]].
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def lowLatencyMemoryStreamToDF(memoryStream: AnyRef): DataFrame = {
+    import org.apache.spark.sql.execution.streaming.runtime.MemoryStreamBase
+    memoryStream.asInstanceOf[MemoryStreamBase[Row]].toDF()
+  }
+
+  /**
+   * Create a [[org.apache.spark.sql.execution.streaming.sources.ContinuousMemorySink]]
+   * for RTM tests. The returned sink must be attached via
+   * [[startStreamingQueryWithSink]]; the standard `writeStream.format("memory")`
+   * route always allocates a regular `MemorySink`.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def createContinuousMemorySink(): AnyRef = {
+    import org.apache.spark.sql.execution.streaming.sources.ContinuousMemorySink
+    new ContinuousMemorySink()
+  }
+
+  /**
+   * Read all rows from a [[org.apache.spark.sql.execution.streaming.sources.ContinuousMemorySink]]
+   * by passing the sink object directly. The Python side calls this for RTM
+   * tests where the sink exists independent of any single streaming query.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def continuousMemorySinkAllData(
+      sink: AnyRef,
+      schema: StructType,
+      sparkSession: SparkSession): DataFrame = {
+    import org.apache.spark.sql.execution.streaming.sources.ContinuousMemorySink
+    val rows = sink.asInstanceOf[ContinuousMemorySink].allData
+    sparkSession.createDataFrame(java.util.Arrays.asList(rows: _*), schema)
+  }
+
+  /**
+   * Build an RTM [[org.apache.spark.sql.streaming.Trigger]] with the given
+   * batch duration in milliseconds. Used by the PySpark `StreamTest` framework
+   * when the user passes `trigger={"realTime": "<duration>"}`.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def realTimeTrigger(batchDurationMs: Long): AnyRef = {
+    import org.apache.spark.sql.execution.streaming.RealTimeTrigger
+    RealTimeTrigger.apply(batchDurationMs)
+  }
+
+  /**
+   * String-form overload for `realTimeTrigger`; delegates to the JVM's
+   * `RealTimeTrigger.apply(String)` so the Python side does not need to
+   * reimplement Spark's duration parsing.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def realTimeTriggerFromString(batchDuration: String): AnyRef = {
+    import org.apache.spark.sql.execution.streaming.RealTimeTrigger
+    RealTimeTrigger.apply(batchDuration)
+  }
+
+  /**
+   * Start a streaming query with an explicit sink instance. This calls the
+   * internal `StreamingQueryManager.startQuery` API used by Scala's
+   * `StreamTest` to attach a custom sink (for example
+   * [[org.apache.spark.sql.execution.streaming.sources.ContinuousMemorySink]]
+   * for RTM). The standard `writeStream.format("memory")` route allocates its
+   * own `MemorySink`, so this helper is the only way to thread a
+   * Python-constructed sink end to end.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def startStreamingQueryWithSink(
+      sparkSession: SparkSession,
+      df: DataFrame,
+      sink: AnyRef,
+      outputMode: String,
+      checkpointLocation: String,
+      trigger: AnyRef,
+      extraOptions: java.util.Map[String, String]): AnyRef = {
+    import org.apache.spark.sql.classic.ClassicConversions.castToImpl
+    import org.apache.spark.sql.connector.catalog.Table
+    import org.apache.spark.sql.streaming.{OutputMode => OM, Trigger}
+    import scala.jdk.CollectionConverters._
+
+    val mode = outputMode.toLowerCase(java.util.Locale.ROOT) match {
+      case "append" => OM.Append
+      case "complete" => OM.Complete
+      case "update" => OM.Update
+      case _ => throw new IllegalArgumentException(s"Unknown output mode: $outputMode")
+    }
+    val tableSink = sink match {
+      case t: Table => t
+      case other => throw new IllegalArgumentException(
+        s"sink must implement org.apache.spark.sql.connector.catalog.Table; " +
+          s"got ${other.getClass.getName}")
+    }
+    val opts =
+      if (extraOptions != null) extraOptions.asScala.toMap else Map.empty[String, String]
+    val jvmTrigger = trigger.asInstanceOf[Trigger]
+
+    castToImpl(sparkSession)
+      .streams
+      .startQuery(
+        userSpecifiedName = None,
+        userSpecifiedCheckpointLocation = Some(checkpointLocation),
+        df = df,
+        extraOptions = opts,
+        sink = tableSink,
+        outputMode = mode,
+        trigger = jvmTrigger)
+  }
+
   def cleanupPythonWorkerLogs(sessionUUID: String, sparkContext: SparkContext): Unit = {
     if (!sparkContext.isStopped) {
       try {
