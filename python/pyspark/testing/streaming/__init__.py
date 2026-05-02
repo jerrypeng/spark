@@ -22,16 +22,17 @@ for the reference implementation. Tests are written as a sequence of
 actions executed against a streaming DataFrame::
 
     from pyspark.testing.streaming import (
-        StreamTest, MemoryStream, AddData, ProcessAllAvailable,
+        StreamTest, MemoryStream, AddData, CheckAnswer,
     )
 
     class MyStreamingTest(StreamTest):
-        def test_smoke(self):
+        def test_double(self):
             source = MemoryStream(self.spark, "int")
+            doubled = source.to_df().selectExpr("value * 2 as value")
             self.run_stream_test(
-                source.to_df(),
+                doubled,
                 AddData(source, 1, 2, 3),
-                ProcessAllAvailable(),
+                CheckAnswer(2, 4, 6),
             )
 """
 
@@ -39,6 +40,10 @@ from pyspark.testing.streaming.actions import (
     AddData,
     Assert,
     AssertOnQuery,
+    CheckAnswer,
+    CheckAnswerByFunc,
+    CheckLastBatch,
+    CheckNewAnswer,
     Execute,
     ExpectFailure,
     ProcessAllAvailable,
@@ -61,4 +66,8 @@ __all__ = [
     "Assert",
     "AssertOnQuery",
     "Execute",
+    "CheckAnswer",
+    "CheckLastBatch",
+    "CheckNewAnswer",
+    "CheckAnswerByFunc",
 ]

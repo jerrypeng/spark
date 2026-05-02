@@ -272,6 +272,75 @@ private[sql] object PythonSQLUtils extends Logging {
     memoryStream.asInstanceOf[MemoryStreamBase[Row]].toDF()
   }
 
+  /**
+   * Helper for the PySpark `StreamTest` framework: extracts the
+   * [[org.apache.spark.sql.execution.streaming.sources.MemorySink]] from a
+   * running streaming query that was started with `format("memory")`.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  private def memorySinkOf(query: AnyRef)
+    : org.apache.spark.sql.execution.streaming.sources.MemorySink = {
+    import org.apache.spark.sql.execution.streaming.runtime.{StreamExecution,
+      StreamingQueryWrapper}
+    import org.apache.spark.sql.execution.streaming.sources.MemorySink
+    val exec: StreamExecution = query match {
+      case w: StreamingQueryWrapper => w.streamingQuery
+      case s: StreamExecution => s
+      case other => throw new IllegalArgumentException(
+        s"Expected a JVM-backed StreamingQuery (StreamingQueryWrapper or " +
+          s"StreamExecution); got ${other.getClass.getName}. " +
+          "This helper does not support Spark Connect remote queries.")
+    }
+    exec.sink match {
+      case s: MemorySink => s
+      case other => throw new IllegalArgumentException(
+        s"Streaming query sink is ${other.getClass.getName}, not MemorySink. " +
+          "Start the query with writeStream.format(\"memory\") to use this helper.")
+    }
+  }
+
+  /**
+   * Returns all rows accumulated in the memory sink of a streaming query,
+   * preserving batch arrival order. The Python `StreamTest` driver uses this
+   * instead of `SELECT * FROM <queryName>` because the SQL path provides no
+   * ordering guarantees and would break per-batch row slicing.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def memorySinkAllData(
+      query: AnyRef,
+      schema: StructType,
+      sparkSession: SparkSession): DataFrame = {
+    val rows = memorySinkOf(query).allData
+    sparkSession.createDataFrame(java.util.Arrays.asList(rows: _*), schema)
+  }
+
+  /**
+   * Returns the rows produced by all batches with id strictly greater than
+   * `sinceBatchId`. Pass `-1L` for "all batches".
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def memorySinkDataSinceBatch(
+      query: AnyRef,
+      sinceBatchId: Long,
+      schema: StructType,
+      sparkSession: SparkSession): DataFrame = {
+    val rows = memorySinkOf(query).dataSinceBatch(sinceBatchId)
+    sparkSession.createDataFrame(java.util.Arrays.asList(rows: _*), schema)
+  }
+
+  /**
+   * Returns the latest committed batch id for the memory sink of `query`, or
+   * `null` if no batch has been committed yet.
+   *
+   * Test-only: not part of the public Spark API.
+   */
+  def memorySinkLatestBatchId(query: AnyRef): java.lang.Long = {
+    memorySinkOf(query).latestBatchId.map(java.lang.Long.valueOf).orNull
+  }
+
   def cleanupPythonWorkerLogs(sessionUUID: String, sparkContext: SparkContext): Unit = {
     if (!sparkContext.isStopped) {
       try {

@@ -30,7 +30,8 @@ import shutil
 import tempfile
 import time
 from collections import namedtuple
-from typing import Any, List
+from dataclasses import dataclass
+from typing import Any, List, NamedTuple
 
 from pyspark.errors import StreamingQueryException
 from pyspark.sql import Row
@@ -40,6 +41,10 @@ from pyspark.testing.streaming import (
     AddData,
     Assert,
     AssertOnQuery,
+    CheckAnswer,
+    CheckAnswerByFunc,
+    CheckLastBatch,
+    CheckNewAnswer,
     Execute,
     ExpectFailure,
     MemoryStream,
@@ -360,6 +365,333 @@ class StreamTestLifecycleTests(StreamTest):
         )
         self.assertTrue(captured)
         self.assertIn("boom", captured[0])
+
+
+# ---------------------------------------------------------------------------
+# Verification actions: CheckAnswer / CheckLastBatch / CheckNewAnswer
+# ---------------------------------------------------------------------------
+
+
+_PERSON_SCHEMA = StructType(
+    [
+        StructField("name", StringType(), True),
+        StructField("age", IntegerType(), True),
+    ]
+)
+
+
+class CheckActionTests(StreamTest):
+    """Tests for CheckAnswer / CheckLastBatch / CheckNewAnswer / CheckAnswerByFunc."""
+
+    def test_passthrough_check_answer(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2, 3),
+            CheckAnswer(Row(value=1), Row(value=2), Row(value=3)),
+        )
+
+    def test_simple_map_check_answer(self):
+        source = MemoryStream(self.spark, "int")
+        mapped = source.to_df().selectExpr("value + 1 as value")
+        self.run_stream_test(
+            mapped,
+            AddData(source, 1, 2, 3),
+            CheckAnswer(2, 3, 4),
+        )
+
+    def test_check_new_answer(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckNewAnswer(1, 2),
+            AddData(source, 3),
+            CheckNewAnswer(3),
+        )
+
+    def test_check_last_batch(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckLastBatch(1, 2),
+            AddData(source, 3, 4),
+            CheckLastBatch(3, 4),
+        )
+
+    def test_aggregation_complete_mode(self):
+        source = MemoryStream(self.spark, "string")
+        counts = source.to_df().groupBy("value").count()
+        self.run_stream_test(
+            counts,
+            AddData(source, "a", "b", "a"),
+            CheckAnswer(("a", 2), ("b", 1)),
+            AddData(source, "b", "b"),
+            CheckAnswer(("a", 2), ("b", 3)),
+            output_mode="complete",
+        )
+
+    def test_filter(self):
+        source = MemoryStream(self.spark, "int")
+        filtered = source.to_df().filter("value > 2")
+        self.run_stream_test(
+            filtered,
+            AddData(source, 1, 2, 3, 4, 5),
+            CheckAnswer(3, 4, 5),
+            AddData(source, 0, 10),
+            CheckAnswer(3, 4, 5, 10),
+        )
+
+    def test_empty_check_answer(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            CheckAnswer(),  # nothing added yet
+            AddData(source, 1),
+            CheckAnswer(1),
+        )
+
+    def test_check_answer_by_func(self):
+        source = MemoryStream(self.spark, "int")
+
+        def check(rows):
+            values = sorted(r.value for r in rows)
+            assert values == [1, 2, 3], f"got {values}"
+
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 3, 1, 2),
+            CheckAnswerByFunc(check),
+        )
+
+    def test_check_answer_by_func_last_only(self):
+        source = MemoryStream(self.spark, "int")
+
+        def only_one_batch(rows):
+            assert len(rows) == 2, f"expected 2 rows in last batch, got {len(rows)}"
+
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1),
+            ProcessAllAvailable(),
+            AddData(source, 2, 3),
+            CheckAnswerByFunc(only_one_batch, last_only=True),
+        )
+
+    def test_stop_and_restart_check_answer(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckAnswer(1, 2),
+            StopStream(),
+            AddData(source, 3),
+            StartStream(),
+            CheckAnswer(1, 2, 3),
+        )
+
+    def test_check_answer_then_check_new_answer(self):
+        """CheckAnswer must advance the cumulative cursor so a follow-up
+        CheckNewAnswer only sees rows added after the CheckAnswer.
+
+        Mirrors Scala's fetchStreamAnswer behavior, which advances
+        lastFetchedMemorySinkLastBatchId on every check action.
+        """
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckAnswer(1, 2),
+            AddData(source, 3),
+            CheckNewAnswer(3),
+        )
+
+    def test_check_last_batch_then_check_new_answer(self):
+        """CheckLastBatch must advance the cumulative-row counter.
+
+        Otherwise a follow-up CheckNewAnswer would re-include rows that
+        were already validated by CheckLastBatch.
+        """
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckLastBatch(1, 2),
+            AddData(source, 3),
+            CheckNewAnswer(3),
+        )
+
+    def test_check_last_batch_then_empty_check_new_answer(self):
+        """CheckNewAnswer with no intervening AddData reports zero new rows."""
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckLastBatch(1, 2),
+            CheckNewAnswer(),
+        )
+
+    def test_check_new_answer_across_restart(self):
+        """``_last_fetched_rows`` must persist across StopStream+StartStream.
+
+        After restart, the framework wipes the checkpoint dir and the
+        ``MemoryStream`` source replays all batches. The new ``MemorySink``
+        therefore exposes the original batch ids 0..N alongside the new
+        batch N+1. ``CheckNewAnswer`` must only return rows from batches
+        the user has not yet acknowledged.
+        """
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2),
+            CheckNewAnswer(1, 2),  # consumes batch 0
+            StopStream(),
+            AddData(source, 3),
+            StartStream(),
+            # The new sink replays batch 0 [1,2] and adds batch 1 [3]; we
+            # expect only the rows from batch 1.
+            CheckNewAnswer(3),
+        )
+
+    def test_check_last_batch_without_committed_batch_fails_clearly(self):
+        source = MemoryStream(self.spark, "int")
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                # No AddData -> no committed batch.
+                CheckLastBatch(1),
+            )
+        self.assertIn("at least one committed batch", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# Flexible-type CheckAnswer (mirrors Scala's ``CheckAnswer[A: Encoder]``)
+# ---------------------------------------------------------------------------
+
+
+class CheckAnswerFlexibleTypesTests(StreamTest):
+    """Verify ``CheckAnswer`` accepts the same shapes as its Scala counterpart."""
+
+    def test_scalars(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df().selectExpr("value + 1 as value"),
+            AddData(source, 1, 2, 3),
+            CheckAnswer(2, 3, 4),
+        )
+
+    def test_string_scalars(self):
+        source = MemoryStream(self.spark, "string")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, "a", "b"),
+            CheckAnswer("a", "b"),
+        )
+
+    def test_tuples(self):
+        source = MemoryStream(self.spark, _PERSON_SCHEMA)
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, ("Alice", 30), ("Bob", 25)),
+            CheckAnswer(("Alice", 30), ("Bob", 25)),
+        )
+
+    def test_dicts(self):
+        source = MemoryStream(self.spark, _PERSON_SCHEMA)
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, {"name": "Alice", "age": 30}),
+            CheckAnswer({"name": "Alice", "age": 30}),
+        )
+
+    def test_dataclass(self):
+        @dataclass
+        class Person:
+            name: str
+            age: int
+
+        source = MemoryStream(self.spark, _PERSON_SCHEMA)
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, Person("Alice", 30), Person("Bob", 25)),
+            CheckAnswer(Person("Alice", 30), Person("Bob", 25)),
+        )
+
+    def test_namedtuple(self):
+        PT = namedtuple("PT", ["name", "age"])
+        source = MemoryStream(self.spark, _PERSON_SCHEMA)
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, PT("Alice", 30)),
+            CheckAnswer(PT("Alice", 30)),
+        )
+
+    def test_typed_namedtuple(self):
+        class TP(NamedTuple):
+            name: str
+            age: int
+
+        source = MemoryStream(self.spark, _PERSON_SCHEMA)
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, TP("Charlie", 40)),
+            CheckAnswer(TP("Charlie", 40)),
+        )
+
+    def test_plain_class(self):
+        class Employee:
+            def __init__(self, name, age):
+                self.name = name
+                self.age = age
+
+        source = MemoryStream(self.spark, _PERSON_SCHEMA)
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, Employee("Diana", 35)),
+            CheckAnswer(Employee("Diana", 35)),
+        )
+
+    def test_mixed_types(self):
+        source = MemoryStream(self.spark, "int")
+        self.run_stream_test(
+            source.to_df(),
+            AddData(source, 1, 2, 3),
+            CheckAnswer(Row(value=1), 2, 3),  # mix Row + scalar
+        )
+
+    def test_aggregation_with_tuples(self):
+        source = MemoryStream(self.spark, "string")
+        counts = source.to_df().groupBy("value").count()
+        self.run_stream_test(
+            counts,
+            AddData(source, "a", "b", "a"),
+            CheckAnswer(("a", 2), ("b", 1)),
+            output_mode="complete",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Negative cases: error messages on Check failures
+# ---------------------------------------------------------------------------
+
+
+class CheckActionErrorReportingTests(StreamTest):
+
+    def test_check_answer_mismatch_includes_diagnostic(self):
+        source = MemoryStream(self.spark, "int")
+        with self.assertRaises(AssertionError) as ctx:
+            self.run_stream_test(
+                source.to_df(),
+                AddData(source, 1, 2),
+                CheckAnswer(99),
+            )
+        msg = str(ctx.exception)
+        self.assertIn("Row mismatch", msg)
+        self.assertIn("Missing rows", msg)
+        self.assertIn("Unexpected rows", msg)
+        # The progress trace should mark the failing action.
+        self.assertIn("=> CheckAnswer", msg)
 
 
 if __name__ == "__main__":

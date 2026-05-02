@@ -35,19 +35,26 @@ import tempfile
 import time
 import traceback
 import unittest
+from collections import Counter
 from typing import Any, Dict, List, NoReturn, Optional
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, Row, SparkSession
+from pyspark.sql.types import StructType
 from pyspark.testing.streaming.actions import (
     AddData,
     Assert,
     AssertOnQuery,
+    CheckAnswer,
+    CheckAnswerByFunc,
+    CheckLastBatch,
+    CheckNewAnswer,
     Execute,
     ExpectFailure,
     ProcessAllAvailable,
     StartStream,
     StopStream,
     StreamAction,
+    _CheckActionBase,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,6 +174,119 @@ class StreamTest(unittest.TestCase):
 _SAFE_IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
+class _MemorySinkReader:
+    """Reads rows from the JVM ``MemorySink`` of a streaming query.
+
+    Goes through ``PythonSQLUtils`` helpers rather than ``SELECT * FROM
+    <queryName>`` so that batch arrival order is preserved (the SQL path
+    provides no ordering guarantees, which breaks per-batch row slicing).
+
+    Each instance is bound to a specific running query; the JVM query
+    handle is updated whenever the framework starts a new query.
+    """
+
+    def __init__(self, spark: SparkSession, output_schema: StructType) -> None:
+        self._spark = spark
+        self._schema = output_schema
+        self._jschema = spark._jsparkSession.parseDataType(output_schema.json())
+        self._jvm = spark._jvm
+        self._jquery: Optional[Any] = None
+
+    def attach(self, jquery: Any) -> None:
+        """Bind to the JVM ``StreamingQuery`` handle."""
+        self._jquery = jquery
+
+    def detach(self) -> None:
+        self._jquery = None
+
+    def _utils(self) -> Any:
+        if self._jquery is None:
+            raise RuntimeError("MemorySinkReader is not attached to any query")
+        return self._jvm.org.apache.spark.sql.api.python.PythonSQLUtils
+
+    def all_data(self) -> List[Row]:
+        utils = self._utils()
+        jdf = utils.memorySinkAllData(
+            self._jquery, self._jschema, self._spark._jsparkSession
+        )
+        return DataFrame(jdf, self._spark).collect()
+
+    def data_since_batch(self, since_batch_id: int) -> List[Row]:
+        utils = self._utils()
+        jdf = utils.memorySinkDataSinceBatch(
+            self._jquery, int(since_batch_id), self._jschema, self._spark._jsparkSession
+        )
+        return DataFrame(jdf, self._spark).collect()
+
+    def latest_batch_id(self) -> Optional[int]:
+        utils = self._utils()
+        jval = utils.memorySinkLatestBatchId(self._jquery)
+        return None if jval is None else int(jval)
+
+
+def _format_rows(rows: List[Row], limit: int = 25) -> str:
+    """Pretty-print up to ``limit`` rows for error messages."""
+    if not rows:
+        return "  <no rows>"
+    shown = rows[:limit]
+    suffix = f"\n  ... ({len(rows) - limit} more)" if len(rows) > limit else ""
+    return "\n".join(f"  {r}" for r in shown) + suffix
+
+
+def _diff_rows(
+    expected: List[Row],
+    actual: List[Row],
+    ordered: bool,
+) -> Optional[str]:
+    """Compare ``expected`` and ``actual``. Return None on match, else error.
+
+    Uses Row-level equality (via ``Row.__eq__``) rather than ``str(...)`` so
+    that Counter keys are tied to the actual data identity. ``Counter`` keys
+    must be hashable; ``Row`` is a tuple subclass and is hashable as long as
+    its values are hashable. For values that aren't hashable (e.g. ``list``,
+    ``dict``), we fall back to a quadratic ``Row.__eq__`` based comparison so
+    error messages stay row-shaped instead of a stringified Counter dict.
+    """
+    if ordered:
+        if expected == actual:
+            return None
+        return (
+            f"Rows not equal (ordered comparison).\n"
+            f"Expected ({len(expected)} rows):\n{_format_rows(expected)}\n"
+            f"Actual ({len(actual)} rows):\n{_format_rows(actual)}"
+        )
+    try:
+        e_counter: Counter = Counter(expected)
+        a_counter: Counter = Counter(actual)
+        if e_counter == a_counter:
+            return None
+        missing_rows = list((e_counter - a_counter).elements())
+        extra_rows = list((a_counter - e_counter).elements())
+    except TypeError:
+        # Unhashable contents -- multiset diff via O(n*m) Row.__eq__.
+        actual_remaining = list(actual)
+        missing_rows = []
+        for row in expected:
+            try:
+                actual_remaining.remove(row)
+            except ValueError:
+                missing_rows.append(row)
+        extra_rows = actual_remaining
+    if not missing_rows and not extra_rows:
+        return None
+    parts: List[str] = []
+    if missing_rows:
+        parts.append(f"Missing rows ({len(missing_rows)}):\n{_format_rows(missing_rows)}")
+    if extra_rows:
+        parts.append(f"Unexpected rows ({len(extra_rows)}):\n{_format_rows(extra_rows)}")
+    return (
+        f"Row mismatch.\n"
+        f"Expected ({len(expected)} rows):\n{_format_rows(expected)}\n"
+        f"Actual ({len(actual)} rows):\n{_format_rows(actual)}\n"
+        + "\n".join(parts)
+    )
+
+
 class _Runner:
     """Single-use ``run_stream_test`` driver.
 
@@ -187,6 +307,7 @@ class _Runner:
         self.stream = stream
         self.output_mode = output_mode
         self.extra_options = extra_options
+        self.output_schema: StructType = stream.schema
 
         # A per-test query name so multiple tests can run with disjoint
         # memory-sink tables. The pid + monotonic ns ensure uniqueness
@@ -195,9 +316,18 @@ class _Runner:
         if not _SAFE_IDENT_RE.match(self.query_name):
             raise RuntimeError(f"Generated unsafe query name: {self.query_name!r}")
         self.checkpoint_dir: str = tempfile.mkdtemp(prefix="stream_test_checkpoint_")
+        self.sink_reader = _MemorySinkReader(self.test.spark, self.output_schema)
 
         self.current_query: Optional[Any] = None
         self.last_query: Optional[Any] = None
+        # Number of rows already consumed by ``CheckNewAnswer`` / a prior
+        # ``_fetch_new`` call. Drives the slice ``all_data[_last_fetched_rows:]``
+        # for ``CheckNewAnswer``. We track row count rather than sink batch id
+        # because batch ids are not stable across StopStream + StartStream
+        # (the new sink may compress replayed source batches into one).
+        # ``MemorySink.allData`` is collected in batch arrival order on the
+        # JVM side, so positional slicing is sound.
+        self._last_fetched_rows: int = 0
         self.actions: List[StreamAction] = self._maybe_auto_start(actions)
         self.pos = 0
 
@@ -295,6 +425,18 @@ class _Runner:
         self.current_query = writer.start()
         if previous_query is not None:
             self.last_query = previous_query
+        # Note: do NOT reset ``_last_fetched_rows`` unconditionally here. For
+        # the supported "append mode + single MemoryStream + framework-managed
+        # checkpoint wipe" configuration, the new query replays all source
+        # batches and the new sink converges to the same cumulative row count
+        # plus any new rows added between stop and start, so preserving the
+        # count gives ``CheckNewAnswer`` the correct semantics across restart.
+        # Complete-mode aggregations and update-mode queries do not have
+        # stable row counts across replay; reset for those modes so post-
+        # restart Check actions work against the new sink from scratch.
+        if self.output_mode != "append":
+            self._last_fetched_rows = 0
+        self.sink_reader.attach(self.current_query._jsq)  # type: ignore[attr-defined]
 
         # Wait briefly for the query thread to come up. If it dies before
         # initialization (e.g. analyzer error), surface that quickly.
@@ -334,6 +476,7 @@ class _Runner:
         finally:
             self.last_query = self.current_query
             self.current_query = None
+            self.sink_reader.detach()
 
     def _wait_for_processing(self) -> None:
         if self.current_query is None:
@@ -342,6 +485,64 @@ class _Runner:
             self.current_query.processAllAvailable()
         except BaseException as e:  # noqa: BLE001
             self._fail("Error waiting for stream processing", e)
+
+    def _fetch_all(self) -> List[Row]:
+        self._verify(self.current_query is not None, "Stream not running")
+        self._wait_for_processing()
+        rows = self.sink_reader.all_data()
+        # Advance the cumulative cursor so a subsequent CheckNewAnswer only
+        # reports rows added *after* this CheckAnswer / CheckAnswerByFunc.
+        # Mirrors Scala's fetchStreamAnswer which always updates
+        # lastFetchedMemorySinkLastBatchId.
+        self._last_fetched_rows = len(rows)
+        return rows
+
+    def _fetch_new(self) -> List[Row]:
+        """Rows added since the previous Check action consumed the sink.
+
+        Uses positional slicing on ``MemorySink.allData`` (which is in batch
+        arrival order) rather than batch ids: the JVM ``MemorySink`` is
+        rebuilt on every ``StartStream`` and may merge replayed source
+        batches into a single sink batch, so batch ids aren't stable across
+        a restart, but the cumulative row order is.
+        """
+        # Capture the cursor *before* ``_fetch_all`` advances it.
+        previous = self._last_fetched_rows
+        all_rows = self._fetch_all()
+        return all_rows[previous:]
+
+    def _fetch_last_batch(self) -> List[Row]:
+        """Rows produced by the most recently committed batch only.
+
+        "Most recent batch" is scoped to the *current* query -- after a
+        ``StartStream`` the sink is reset, so this action never reaches
+        back into a previous run. Fails the test when no batch has
+        committed yet so the user gets a clear error rather than an
+        empty-actual diff.
+        """
+        self._verify(self.current_query is not None, "Stream not running")
+        self._wait_for_processing()
+        latest = self.sink_reader.latest_batch_id()
+        if latest is None:
+            self._fail(
+                "CheckLastBatch / CheckLastBatchByFunc requires at least one "
+                "committed batch but the memory sink has none yet. Add "
+                "AddData(source, ...) and ProcessAllAvailable() before this "
+                "action, or use CheckAnswer for cumulative checks."
+            )
+        rows = self.sink_reader.data_since_batch(latest - 1)
+        # Keep cumulative tracking in sync so a follow-up CheckNewAnswer
+        # after CheckLastBatch sees zero new rows. ``_fetch_all`` here is
+        # cheap (the wait_for_processing above already drained the query)
+        # and is used for its side effect of advancing ``_last_fetched_rows``.
+        self._fetch_all()
+        return rows
+
+    def _check(self, action: _CheckActionBase, actual: List[Row]) -> None:
+        expected = action.resolve_expected(self.output_schema)
+        diff = _diff_rows(expected, actual, action.ordered)
+        if diff:
+            self._fail(diff)
 
     # ----- action dispatch ---------------------------------------------
 
@@ -366,6 +567,30 @@ class _Runner:
 
         if isinstance(action, ProcessAllAvailable):
             self._wait_for_processing()
+            return
+
+        if isinstance(action, CheckAnswer):
+            self._check(action, self._fetch_all())
+            return
+
+        if isinstance(action, CheckLastBatch):
+            self._check(action, self._fetch_last_batch())
+            return
+
+        if isinstance(action, CheckNewAnswer):
+            self._check(action, self._fetch_new())
+            return
+
+        if isinstance(action, CheckAnswerByFunc):
+            actual = (
+                self._fetch_last_batch() if action.last_only else self._fetch_all()
+            )
+            try:
+                action.check_func(actual)
+            except AssertionError:
+                raise
+            except BaseException as e:  # noqa: BLE001
+                self._fail(f"CheckAnswerByFunc raised: {e}", e)
             return
 
         if isinstance(action, ExpectFailure):
@@ -408,6 +633,7 @@ class _Runner:
                     self._fail(f"ExpectFailure.assert_failure raised: {e}", e)
             self.last_query = self.current_query
             self.current_query = None
+            self.sink_reader.detach()
             return
 
         if isinstance(action, Assert):
@@ -473,6 +699,7 @@ class _Runner:
                             )
                 except Exception:
                     logger.exception("Failed to stop query during teardown")
+            self.sink_reader.detach()
             try:
                 shutil.rmtree(self.checkpoint_dir, ignore_errors=True)
             except Exception:
