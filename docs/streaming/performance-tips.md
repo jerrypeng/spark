@@ -80,6 +80,8 @@ This is caused by the fact that when async progress tracking is enabled, the fra
 # Continuous Processing
 ## [Experimental]
 
+**Note:** For new low-latency streaming workloads, we recommend using [Real-time Mode](./real-time-mode.html) instead. Real-time Mode is a newer low-latency execution mode that supports a broader set of operations than Continuous Processing.
+
 **Continuous processing** is a new, experimental streaming execution mode introduced in Spark 2.3 that enables low (~1 ms) end-to-end latency with at-least-once fault-tolerance guarantees. Compare this with the default *micro-batch processing* engine which can achieve exactly-once guarantees but achieve latencies of ~100ms at best. For some types of queries (discussed below), you can choose which mode to execute them in without modifying the application logic (i.e. without changing the DataFrame/Dataset operations).
 
 To run a supported query in continuous processing mode, all you need to do is specify a **continuous trigger** with the desired checkpoint interval as a parameter. For example,

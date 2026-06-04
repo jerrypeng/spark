@@ -2472,8 +2472,8 @@ streamingDF.writeStream.foreachBatch { (batchDF: DataFrame, batchId: Long) =>
 **Note:**
 - By default, `foreachBatch` provides only at-least-once write guarantees. However, you can use the
   batchId provided to the function as way to deduplicate the output and get an exactly-once guarantee.
-- `foreachBatch` does not work with the continuous processing mode as it fundamentally relies on the
-  micro-batch execution of a streaming query. If you write data in the continuous mode, use `foreach` instead.
+- `foreachBatch` fundamentally relies on the micro-batch execution of a streaming query, so it is
+  not available in execution modes that process records one at a time. In those modes, use `foreach` instead.
 - If `foreachBatch` is used with stateful streaming queries and multiple DataFrame actions are performed
   on the same DataFrame (such as `df.count()` followed by `df.collect()`), the query will be evaluated multiple times leading to
   the state being reloaded multiple times within the same batch resulting in degraded performance. In this case,
@@ -2481,8 +2481,8 @@ streamingDF.writeStream.foreachBatch { (batchDF: DataFrame, batchId: Long) =>
   within the `foreachBatch` UDF (user-defined function) to avoid recomputation.
 
 ###### Foreach
-If `foreachBatch` is not an option (for example, corresponding batch data writer does not exist, or
-continuous processing mode), then you can express your custom writer logic using `foreach`.
+If `foreachBatch` is not an option (for example, the corresponding batch data writer does not exist,
+or the execution mode does not support `foreachBatch`), then you can express your custom writer logic using `foreach`.
 Specifically, you can express the data writing logic by dividing it into three methods: `open`, `process`, and `close`.
 Since Spark 2.4, `foreach` is available in Scala, Java and Python.
 
@@ -2731,7 +2731,7 @@ For more details, please check the docs for DataStreamReader ([Python](/api/pyth
 
 #### Triggers
 The trigger settings of a streaming query define the timing of streaming data processing, whether
-the query is going to be executed as micro-batch query with a fixed batch interval or as a continuous processing query.
+the query is going to be executed as a micro-batch query with a fixed batch interval or in Real-time Mode.
 Here are the different kinds of triggers that are supported.
 
 <table>
@@ -2799,10 +2799,12 @@ Here are the different kinds of triggers that are supported.
     </td>
   </tr>
   <tr>
-    <td><b>Continuous with fixed checkpoint interval</b><br/><i>(experimental)</i></td>
+    <td><b>Real-time Mode</b></td>
     <td>
-        The query will be executed in the new low-latency, continuous processing mode. Read more
-        about this in the <a href="./performance-tips.html#continuous-processing">Continuous Processing section</a> below.
+        The query will be executed in Real-time Mode, a low-latency execution mode in which
+        long-running tasks process records continuously as they arrive. The duration passed to the
+        trigger is the checkpoint interval, not a latency target. Real-time Mode supports stateless
+        queries only. Read more in the <a href="./real-time-mode.html">Real-time Mode</a> page.
     </td>
   </tr>
 </table>
@@ -2838,10 +2840,10 @@ df.writeStream \
   .trigger(availableNow=True) \
   .start()
 
-# Continuous trigger with one-second checkpointing interval
-df.writeStream
-  .format("console")
-  .trigger(continuous='1 second')
+# Real-time Mode trigger with a five-minute checkpoint interval
+df.writeStream \
+  .format("console") \
+  .trigger(realTime='5 minutes') \
   .start()
 
 {% endhighlight %}
@@ -2875,10 +2877,10 @@ df.writeStream
   .trigger(Trigger.AvailableNow())
   .start()
 
-// Continuous trigger with one-second checkpointing interval
+// Real-time Mode trigger with a five-minute checkpoint interval
 df.writeStream
   .format("console")
-  .trigger(Trigger.Continuous("1 second"))
+  .trigger(Trigger.RealTime("5 minutes"))
   .start()
 
 {% endhighlight %}
@@ -2914,10 +2916,10 @@ df.writeStream
   .trigger(Trigger.AvailableNow())
   .start();
 
-// Continuous trigger with one-second checkpointing interval
+// Real-time Mode trigger with a five-minute checkpoint interval
 df.writeStream
   .format("console")
-  .trigger(Trigger.Continuous("1 second"))
+  .trigger(Trigger.RealTime("5 minutes"))
   .start();
 
 {% endhighlight %}
@@ -2936,7 +2938,7 @@ write.stream(df, "console", trigger.processingTime = "2 seconds")
 # One-time trigger
 write.stream(df, "console", trigger.once = TRUE)
 
-# Continuous trigger is not yet supported
+# Real-time Mode trigger is not yet supported
 {% endhighlight %}
 </div>
 
