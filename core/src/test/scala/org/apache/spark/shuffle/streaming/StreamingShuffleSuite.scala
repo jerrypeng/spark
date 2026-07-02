@@ -43,7 +43,7 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER, STREAMING_SHUFFLE_CHEC
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
-import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, TerminationControlMessage}
+import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.MyRDD
 import org.apache.spark.serializer.JavaSerializerInstance
@@ -530,29 +530,37 @@ class StreamingShuffleSuite
     error.get.getMessage should include("closed before termination")
   }
 
-  test("reader does not error when a writer closes after termination") {
-    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
-      val g = new ShuffleGroup[Int](sc, 1, 1)
-
-      // A normal end-to-end exchange: the writer sends data and a termination message, the
-      // reader acks it, and the writer's write() returns. A clean close after termination must
-      // NOT be mistaken for a premature disconnect, since terminationReceived is set.
-      val writeResult = g.write(0, Iterator((1, 1), (2, 2)))
-      val readData = await(g.read(0)._2)
-      await(writeResult)
-
-      readData should not be empty
-
-      // After a clean exchange both sides tear down their connections (the reader on task
-      // completion, the writer on server close). Wait until the reader's client channel is
-      // inactive, which guarantees channelInactive has run. Because the termination message was
-      // received first, the handler must not have recorded an error; a regression in the
-      // terminationReceived logic would surface as a "closed before termination" error here.
-      eventually(Timeout(10.seconds)) {
-        g.readers(0).clientMap.get(0L).isActive should be(false)
-      }
-      g.readers(0).errorNotifier.getError() should be(None)
+  test("client handler records no error when the connection closes after termination") {
+    // The mirror of the premature-disconnect test: once a TerminationControlMessage has been
+    // received, the subsequent channelInactive (a clean end-of-stream close) must NOT be treated
+    // as a failure. Driven deterministically at the handler level -- feeding receive() a real
+    // termination message sets terminationReceived through the production code path -- so there is
+    // no reliance on Netty event-loop timing.
+    val errorNotifier = new ErrorNotifier()
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, new LinkedBlockingQueue[StreamingShuffleMessage](), shuffleId, Long.MaxValue,
+      context = null, errorNotifier = errorNotifier) {
+      // The reader would normally send an ack over the network here; suppress it since this test
+      // has no client/channel. terminationReceived is set in receive() before this is called.
+      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit =
+        ()
     }
+
+    // Encode a TerminationControlMessage on the wire and hand it to receive(), exactly as a real
+    // writer would. The header is: message-type id (int), sequence number (long), writer id (int),
+    // reader id (int); the sequence number must be 0 since the handler expects a gapless sequence
+    // starting at 0.
+    val encoded = ByteBuffer.allocate(20)
+    encoded.putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id())
+    encoded.putLong(0L)
+    encoded.putInt(0) // shuffleWriterId
+    encoded.putInt(0) // shuffleReaderId
+    encoded.flip()
+    handler.receive(null, encoded, null)
+
+    // A clean close after termination: the handler must record no error.
+    handler.channelInactive(null)
+    errorNotifier.getError() should be(None)
   }
 
   test("reader catches out of order message sequence number from writer - duplicate") {
