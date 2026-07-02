@@ -511,6 +511,50 @@ class StreamingShuffleSuite
       }))
   }
 
+  test("client handler records an error when the connection closes before termination") {
+    // A writer that dies mid-stream closes its connection without sending a
+    // TerminationControlMessage. Netty then fires channelInactive on the reader's client handler.
+    // Because no termination was received, the handler must record an error so the reader's read
+    // loop fails via checkTaskFailure() instead of polling the message queue forever. (The reader
+    // surfacing an ErrorNotifier error as a task failure is covered by the send-failure tests.)
+    val errorNotifier = new ErrorNotifier()
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, new LinkedBlockingQueue[StreamingShuffleMessage](), shuffleId, Long.MaxValue,
+      context = null, errorNotifier = errorNotifier)
+
+    // channelInactive ignores its client argument, so a null is fine here.
+    handler.channelInactive(null)
+
+    val error = errorNotifier.getError()
+    error.isDefined should be(true)
+    error.get.getMessage should include("closed before termination")
+  }
+
+  test("reader does not error when a writer closes after termination") {
+    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
+      val g = new ShuffleGroup[Int](sc, 1, 1)
+
+      // A normal end-to-end exchange: the writer sends data and a termination message, the
+      // reader acks it, and the writer's write() returns. A clean close after termination must
+      // NOT be mistaken for a premature disconnect, since terminationReceived is set.
+      val writeResult = g.write(0, Iterator((1, 1), (2, 2)))
+      val readData = await(g.read(0)._2)
+      await(writeResult)
+
+      readData should not be empty
+
+      // After a clean exchange both sides tear down their connections (the reader on task
+      // completion, the writer on server close). Wait until the reader's client channel is
+      // inactive, which guarantees channelInactive has run. Because the termination message was
+      // received first, the handler must not have recorded an error; a regression in the
+      // terminationReceived logic would surface as a "closed before termination" error here.
+      eventually(Timeout(10.seconds)) {
+        g.readers(0).clientMap.get(0L).isActive should be(false)
+      }
+      g.readers(0).errorNotifier.getError() should be(None)
+    }
+  }
+
   test("reader catches out of order message sequence number from writer - duplicate") {
     withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
       val g = new ShuffleGroup[Int](sc, 1, 1)
